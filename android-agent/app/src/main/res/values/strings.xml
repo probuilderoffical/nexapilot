@@ -1,0 +1,4 @@
+<resources>
+    <string name="app_name">NexaPilot Mobile</string>
+    <string name="accessibility_description">Allows NexaPilot to perform user-approved taps, swipes, navigation, and screen interactions on this phone.</string>
+</resources>
