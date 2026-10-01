@@ -1,11 +1,15 @@
 package com.nexapilot.mobile;
 
+import android.app.Activity;
+import android.content.ActivityNotFoundException;
 import android.content.Intent;
 import android.content.SharedPreferences;
 import android.graphics.Color;
+import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
 import android.provider.Settings;
+import android.speech.RecognizerIntent;
 import android.text.InputType;
 import android.view.View;
 import android.widget.Button;
@@ -25,11 +29,14 @@ import java.io.OutputStream;
 import java.net.HttpURLConnection;
 import java.net.URL;
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.Locale;
 import java.util.UUID;
 
-public class MainActivity extends android.app.Activity {
+public class MainActivity extends Activity {
     private static final String SUPABASE_URL = "https://cdwcvmeruzjhjcahehqg.supabase.co";
     private static final String SUPABASE_KEY = "sb_publishable_EPJE4UJ1EcsGuf2uZxvmyg_fc3QJU2F";
+    private static final int VOICE_REQUEST = 2001;
 
     private SharedPreferences prefs;
     private String accessToken;
@@ -94,7 +101,7 @@ public class MainActivity extends android.app.Activity {
         TextView title = text("NexaPilot Mobile", 28);
         title.setTextColor(Color.WHITE);
         root.addView(title);
-        root.addView(text("AI command center for this phone and your connected devices. v0.1.0", 14));
+        root.addView(text("AI command center for this phone and your connected devices. v0.2.0", 14));
 
         statusText = text("Ready", 14);
         root.addView(statusText);
@@ -138,16 +145,20 @@ public class MainActivity extends android.app.Activity {
         commandPanel.addView(testHome);
 
         commandPanel.addView(text("AI Command", 18));
-        commandInput = input("Example: Open Chrome and search for affordable laptops");
+        commandInput = input("Example: Open ChatGPT");
         commandInput.setMinLines(3);
         commandInput.setGravity(android.view.Gravity.TOP);
         commandPanel.addView(commandInput);
 
-        Button plan = button("Plan command with NexaPilot AI");
-        plan.setOnClickListener(v -> planCommand());
-        commandPanel.addView(plan);
+        Button voice = button("🎤 Voice command");
+        voice.setOnClickListener(v -> startVoiceInput());
+        commandPanel.addView(voice);
 
-        planText = text("No AI plan yet.", 13);
+        Button run = button("Run command with NexaPilot AI");
+        run.setOnClickListener(v -> planCommand(true));
+        commandPanel.addView(run);
+
+        planText = text("No AI command yet.", 13);
         planText.setTextIsSelectable(true);
         planText.setPadding(12, 20, 12, 20);
         commandPanel.addView(planText);
@@ -161,6 +172,30 @@ public class MainActivity extends android.app.Activity {
         commandPanel.addView(signOut);
 
         setContentView(scroll);
+    }
+
+    private void startVoiceInput() {
+        try {
+            Intent intent = new Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH);
+            intent.putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM);
+            intent.putExtra(RecognizerIntent.EXTRA_LANGUAGE, Locale.getDefault());
+            intent.putExtra(RecognizerIntent.EXTRA_PROMPT, "NexaPilot command bolo");
+            startActivityForResult(intent, VOICE_REQUEST);
+        } catch (ActivityNotFoundException e) {
+            Toast.makeText(this, "Voice recognition is not available on this phone.", Toast.LENGTH_LONG).show();
+        }
+    }
+
+    @Override
+    protected void onActivityResult(int requestCode, int resultCode, Intent data) {
+        super.onActivityResult(requestCode, resultCode, data);
+        if (requestCode == VOICE_REQUEST && resultCode == RESULT_OK && data != null) {
+            ArrayList<String> results = data.getStringArrayListExtra(RecognizerIntent.EXTRA_RESULTS);
+            if (results != null && !results.isEmpty()) {
+                commandInput.setText(results.get(0));
+                planCommand(true);
+            }
+        }
     }
 
     private void refreshPanels() {
@@ -234,10 +269,16 @@ public class MainActivity extends android.app.Activity {
                         .put("name", label)
                         .put("platform", "android")
                         .put("os_version", "Android " + Build.VERSION.RELEASE)
-                        .put("agent_version", "0.1.0")
+                        .put("agent_version", "0.2.0")
                         .put("status", "online")
                         .put("last_seen_at", java.time.Instant.now().toString())
-                        .put("capabilities", new JSONObject().put("accessibility", true).put("gestures", Build.VERSION.SDK_INT >= 24));
+                        .put("capabilities", new JSONObject()
+                                .put("accessibility", true)
+                                .put("gestures", Build.VERSION.SDK_INT >= 24)
+                                .put("voice", true)
+                                .put("open_app", true)
+                                .put("open_url", true)
+                                .put("type_text", true));
 
                 HttpResult saved;
                 if (rows.length() > 0) {
@@ -259,10 +300,10 @@ public class MainActivity extends android.app.Activity {
         }).start();
     }
 
-    private void planCommand() {
+    private void planCommand(boolean execute) {
         String command = commandInput.getText().toString().trim();
         if (command.isEmpty()) return;
-        planText.setText("NexaPilot is planning...");
+        planText.setText("NexaPilot is thinking...");
         new Thread(() -> {
             try {
                 JSONObject payload = new JSONObject().put("message", command).put("target", "android");
@@ -272,17 +313,98 @@ public class MainActivity extends android.app.Activity {
                     return;
                 }
                 if (result.code < 200 || result.code >= 300) {
-                    ui(() -> planText.setText("AI error HTTP " + result.code + "\n" + result.body));
+                    ui(() -> planText.setText("AI temporarily unavailable (HTTP " + result.code + "). Try again in a moment.\n" + result.body));
                     return;
                 }
                 JSONObject json = new JSONObject(result.body);
                 JSONObject plan = json.optJSONObject("plan");
+                String model = json.optString("model", "Gemini");
                 String pretty = plan != null ? plan.toString(2) : json.toString(2);
-                ui(() -> planText.setText(pretty));
+                ui(() -> planText.setText("Model: " + model + "\n" + pretty));
+                if (execute && plan != null) executePlan(plan);
             } catch (Exception e) {
                 ui(() -> planText.setText("AI error: " + e.getMessage()));
             }
         }).start();
+    }
+
+    private void executePlan(JSONObject plan) {
+        if (plan.optBoolean("needs_clarification", false)) return;
+        JSONArray actions = plan.optJSONArray("actions");
+        if (actions == null) return;
+
+        ui(() -> {
+            for (int i = 0; i < actions.length(); i++) {
+                JSONObject action = actions.optJSONObject(i);
+                if (action == null) continue;
+                if (action.optBoolean("requires_approval", false)) {
+                    Toast.makeText(this, "Approval required for: " + action.optString("tool"), Toast.LENGTH_LONG).show();
+                    continue;
+                }
+                executeAction(action);
+            }
+        });
+    }
+
+    private void executeAction(JSONObject action) {
+        String tool = action.optString("tool", "");
+        JSONObject args = action.optJSONObject("args");
+        if (args == null) args = new JSONObject();
+
+        try {
+            switch (tool) {
+                case "open_app":
+                    openApp(args.optString("app", args.optString("package", "")));
+                    break;
+                case "open_url":
+                    String url = args.optString("url", "");
+                    if (!url.isEmpty()) startActivity(new Intent(Intent.ACTION_VIEW, Uri.parse(url)));
+                    break;
+                case "press_key":
+                    String key = args.optString("key", "").toLowerCase(Locale.ROOT);
+                    if ("home".equals(key)) NexaAccessibilityService.goHome();
+                    else if ("back".equals(key)) NexaAccessibilityService.goBack();
+                    break;
+                case "type_text":
+                    NexaAccessibilityService.typeIntoFocusedField(args.optString("text", ""));
+                    break;
+                default:
+                    Toast.makeText(this, "Tool not supported yet: " + tool, Toast.LENGTH_SHORT).show();
+            }
+        } catch (Exception e) {
+            Toast.makeText(this, "Action failed: " + e.getMessage(), Toast.LENGTH_LONG).show();
+        }
+    }
+
+    private void openApp(String appName) {
+        String value = appName == null ? "" : appName.trim();
+        if (value.isEmpty()) return;
+        String lower = value.toLowerCase(Locale.ROOT);
+        String[] candidates;
+        if (lower.contains("chatgpt")) {
+            candidates = new String[]{"com.openai.chatgpt"};
+        } else if (lower.contains("chrome")) {
+            candidates = new String[]{"com.android.chrome"};
+        } else if (lower.contains("youtube")) {
+            candidates = new String[]{"com.google.android.youtube"};
+        } else if (lower.contains("whatsapp")) {
+            candidates = new String[]{"com.whatsapp"};
+        } else if (lower.contains("facebook")) {
+            candidates = new String[]{"com.facebook.katana"};
+        } else if (lower.contains("instagram")) {
+            candidates = new String[]{"com.instagram.android"};
+        } else {
+            candidates = new String[]{value};
+        }
+
+        for (String pkg : candidates) {
+            Intent launch = getPackageManager().getLaunchIntentForPackage(pkg);
+            if (launch != null) {
+                startActivity(launch);
+                return;
+            }
+        }
+        Toast.makeText(this, "App not found: " + value, Toast.LENGTH_LONG).show();
     }
 
     private void signOut() {
@@ -296,7 +418,7 @@ public class MainActivity extends android.app.Activity {
         HttpURLConnection conn = (HttpURLConnection) new URL(urlValue).openConnection();
         conn.setRequestMethod(method);
         conn.setConnectTimeout(15000);
-        conn.setReadTimeout(30000);
+        conn.setReadTimeout(45000);
         conn.setRequestProperty("apikey", SUPABASE_KEY);
         conn.setRequestProperty("Content-Type", "application/json");
         if (bearer != null) conn.setRequestProperty("Authorization", "Bearer " + bearer);
