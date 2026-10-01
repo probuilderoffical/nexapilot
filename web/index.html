@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="theme-color" content="#111827" />
+  <link rel="manifest" href="./manifest.webmanifest" />
+  <link rel="stylesheet" href="./styles.css" />
+  <title>NexaPilot</title>
+</head>
+<body>
+  <main class="shell">
+    <section class="card" id="authCard">
+      <h1>NexaPilot</h1>
+      <p>AI command center for your devices.</p>
+      <input id="email" type="email" placeholder="Email" />
+      <input id="password" type="password" placeholder="Password" />
+      <div class="row">
+        <button id="signInBtn">Sign in</button>
+        <button id="signUpBtn" class="secondary">Sign up</button>
+      </div>
+      <p id="authStatus" class="muted"></p>
+    </section>
+
+    <section class="card hidden" id="appCard">
+      <div class="topbar">
+        <div>
+          <h1>NexaPilot</h1>
+          <p id="userLabel" class="muted"></p>
+        </div>
+        <button id="signOutBtn" class="secondary">Sign out</button>
+      </div>
+
+      <label for="target">Target</label>
+      <select id="target">
+        <option value="auto">Auto</option>
+        <option value="windows">Windows</option>
+        <option value="android">Android</option>
+        <option value="web">Web</option>
+      </select>
+
+      <label for="command">Command</label>
+      <textarea id="command" rows="5" placeholder="Example: Open Chrome and search for 10 restaurant websites with weak mobile design"></textarea>
+      <button id="runBtn">Plan command</button>
+
+      <div class="status" id="runStatus"></div>
+
+      <h2>Plan</h2>
+      <pre id="planOutput">No command yet.</pre>
+
+      <h2>Devices</h2>
+      <div id="devices">No devices registered yet.</div>
+    </section>
+  </main>
+
+  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+  <script src="./app.js"></script>
+</body>
+</html>
