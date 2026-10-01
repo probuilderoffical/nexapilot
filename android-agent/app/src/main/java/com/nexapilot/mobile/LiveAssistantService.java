@@ -5,7 +5,6 @@ import android.app.NotificationChannel;
 import android.app.NotificationManager;
 import android.app.PendingIntent;
 import android.app.Service;
-import android.content.Context;
 import android.content.Intent;
 import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
@@ -62,11 +61,14 @@ public class LiveAssistantService extends Service {
     public static final String ACTION_SPEAKER_ON = "com.nexapilot.mobile.SPEAKER_ON";
     public static final String ACTION_SPEAKER_OFF = "com.nexapilot.mobile.SPEAKER_OFF";
 
-    private static final String CHANNEL_ID = "nexapilot_live_v2";
+    private static final String CHANNEL_ID = "nexapilot_live_v3";
     private static final int NOTIFICATION_ID = 91;
     private static final String SUPABASE_URL = "https://cdwcvmeruzjhjcahehqg.supabase.co";
     private static final String SUPABASE_KEY = "sb_publishable_EPJE4UJ1EcsGuf2uZxvmyg_fc3QJU2F";
     private static final String MODEL = "models/gemini-3.8-live";
+
+    private static volatile LiveAssistantService instance;
+    private static volatile boolean screenVisionActive = false;
 
     private final OkHttpClient http = new OkHttpClient.Builder().build();
     private final ExecutorService io = Executors.newCachedThreadPool();
@@ -74,7 +76,7 @@ public class LiveAssistantService extends Service {
     private WebSocket socket;
     private AudioRecord recorder;
     private AudioTrack player;
-    private AcousticEchoCanceler aec;
+    private AcousticEchoCanceler echoCanceler;
     private NoiseSuppressor noiseSuppressor;
     private volatile boolean running;
     private volatile boolean setupComplete;
@@ -87,9 +89,41 @@ public class LiveAssistantService extends Service {
     private Button overlayMic;
     private Button overlaySpeaker;
 
+    public static boolean isRunningLive() {
+        LiveAssistantService s = instance;
+        return s != null && s.running && s.setupComplete;
+    }
+
+    public static boolean submitText(String text) {
+        LiveAssistantService s = instance;
+        if (s == null || !s.running || !s.setupComplete || s.socket == null || text == null || text.trim().isEmpty()) return false;
+        try {
+            JSONObject realtime = new JSONObject().put("text", text.trim());
+            return s.socket.send(new JSONObject().put("realtimeInput", realtime).toString());
+        } catch (Exception e) { return false; }
+    }
+
+    public static void pushVideoFrame(byte[] jpeg) {
+        LiveAssistantService s = instance;
+        if (s == null || !s.running || !s.setupComplete || s.socket == null || jpeg == null || jpeg.length == 0) return;
+        try {
+            JSONObject video = new JSONObject()
+                    .put("data", Base64.encodeToString(jpeg, Base64.NO_WRAP))
+                    .put("mimeType", "image/jpeg");
+            s.socket.send(new JSONObject().put("realtimeInput", new JSONObject().put("video", video)).toString());
+        } catch (Exception ignored) { }
+    }
+
+    public static void notifyScreenVisionChanged(boolean active) {
+        screenVisionActive = active;
+        LiveAssistantService s = instance;
+        if (s != null) s.updateStatus(active ? "Live • screen vision on" : "Live • screen vision off");
+    }
+
     @Override
     public void onCreate() {
         super.onCreate();
+        instance = this;
         prefs = getSharedPreferences("nexapilot", MODE_PRIVATE);
         micEnabled = prefs.getBoolean("live_mic", true);
         speakerEnabled = prefs.getBoolean("live_speaker", true);
@@ -109,18 +143,18 @@ public class LiveAssistantService extends Service {
         else if (ACTION_SPEAKER_ON.equals(action)) setSpeaker(true);
         else if (ACTION_SPEAKER_OFF.equals(action)) setSpeaker(false);
 
-        startForeground(NOTIFICATION_ID, buildNotification());
+        startForeground(NOTIFICATION_ID, buildNotification("Starting Live…"));
         showOverlayIfAllowed();
         if (!running) startLive();
         return START_STICKY;
     }
 
-    @Override
-    public IBinder onBind(Intent intent) { return null; }
+    @Override public IBinder onBind(Intent intent) { return null; }
 
     @Override
     public void onDestroy() {
-        stopLive();
+        instance = null;
+        cleanup(false);
         io.shutdownNow();
         super.onDestroy();
     }
@@ -135,148 +169,121 @@ public class LiveAssistantService extends Service {
         setupComplete = false;
         prefs.edit().putBoolean("live_enabled", true).apply();
         updateStatus("Connecting…");
-        io.execute(() -> fetchEphemeralTokenAndConnect(accessToken));
+        io.execute(() -> fetchTokenAndConnect(accessToken));
     }
 
-    private void fetchEphemeralTokenAndConnect(String accessToken) {
+    private void fetchTokenAndConnect(String accessToken) {
         try {
             HttpResult r = request("POST", SUPABASE_URL + "/functions/v1/live-token", "{}", accessToken);
             if (r.code < 200 || r.code >= 300) {
-                updateStatus("Live token error " + r.code);
                 running = false;
+                updateStatus("Live token error " + r.code);
                 return;
             }
             JSONObject json = new JSONObject(r.body);
             String token = json.optString("token", "");
             if (token.isEmpty()) {
-                updateStatus("Live token missing");
                 running = false;
+                updateStatus("Live token missing");
                 return;
             }
-            String wsUrl = "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContentConstrained?access_token="
+            String ws = "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContentConstrained?access_token="
                     + URLEncoder.encode(token, "UTF-8");
-            Request req = new Request.Builder().url(wsUrl).build();
-            socket = http.newWebSocket(req, new LiveSocketListener());
+            socket = http.newWebSocket(new Request.Builder().url(ws).build(), new LiveSocketListener());
         } catch (Exception e) {
-            updateStatus("Connect failed");
             running = false;
+            updateStatus("Connect failed");
         }
     }
 
     private class LiveSocketListener extends WebSocketListener {
-        @Override
-        public void onOpen(WebSocket webSocket, Response response) {
-            updateStatus("Setting up Live…");
-            sendSetup(webSocket);
-        }
-
-        @Override
-        public void onMessage(WebSocket webSocket, String text) {
-            try { handleServerMessage(new JSONObject(text)); }
-            catch (Exception ignored) { }
-        }
-
-        @Override
-        public void onClosing(WebSocket webSocket, int code, String reason) {
-            updateStatus("Live closing…");
-        }
-
-        @Override
-        public void onClosed(WebSocket webSocket, int code, String reason) {
-            setupComplete = false;
-            if (running) updateStatus("Live disconnected");
-        }
-
-        @Override
-        public void onFailure(WebSocket webSocket, Throwable t, Response response) {
-            setupComplete = false;
-            updateStatus("Live connection error");
-        }
+        @Override public void onOpen(WebSocket webSocket, Response response) { updateStatus("Setting up Live…"); sendSetup(webSocket); }
+        @Override public void onMessage(WebSocket webSocket, String text) { try { handleServerMessage(new JSONObject(text)); } catch (Exception ignored) { } }
+        @Override public void onClosed(WebSocket webSocket, int code, String reason) { setupComplete = false; if (running) updateStatus("Live disconnected"); }
+        @Override public void onFailure(WebSocket webSocket, Throwable t, Response response) { setupComplete = false; if (running) updateStatus("Live connection error"); }
     }
 
-    private void sendSetup(WebSocket webSocket) {
+    private void sendSetup(WebSocket ws) {
         try {
             JSONObject setup = new JSONObject();
             setup.put("model", MODEL);
-            setup.put("generationConfig", new JSONObject().put("responseModalities", new JSONArray().put("AUDIO")));
+            JSONObject generation = new JSONObject()
+                    .put("responseModalities", new JSONArray().put("AUDIO"))
+                    .put("speechConfig", new JSONObject().put("voiceConfig", new JSONObject()
+                            .put("prebuiltVoiceConfig", new JSONObject().put("voiceName", "Kore"))));
+            setup.put("generationConfig", generation);
             setup.put("inputAudioTranscription", new JSONObject());
             setup.put("outputAudioTranscription", new JSONObject());
+            setup.put("realtimeInputConfig", new JSONObject()
+                    .put("automaticActivityDetection", new JSONObject()
+                            .put("disabled", false)
+                            .put("startOfSpeechSensitivity", "START_SENSITIVITY_LOW")
+                            .put("endOfSpeechSensitivity", "END_SENSITIVITY_HIGH")));
 
-            JSONObject system = new JSONObject();
-            system.put("parts", new JSONArray().put(new JSONObject().put("text",
-                    "You are NexaPilot, a live Android device assistant. Speak naturally and briefly in Roman Urdu unless the user speaks another language. " +
-                    "You can use phone tools. Before a visible action, briefly tell the user what you are doing. After a tool result, continue naturally. " +
-                    "Prefer semantic tools: open_app, read_screen, click_text, type_text, scroll, browser_search, back, home. " +
-                    "For multi-step tasks, observe the screen after each important action and continue until the goal is done. " +
-                    "Do not perform purchases, send messages, delete data, change security/auth settings, or publish content without explicit confirmation. " +
-                    "Never request passwords, OTPs, recovery codes or secret API keys. If an action is blocked by Android permissions, explain what permission is needed.")));
-            setup.put("systemInstruction", system);
+            String instructions = "You are NexaPilot, a professional live Android AI operator. Talk naturally, briefly and confidently in Roman Urdu by default. " +
+                    "You receive live microphone audio, optional screen frames and phone tools. You may interrupt naturally and the user may interrupt you. " +
+                    "When asked to operate the phone, say a short progress phrase, use tools, observe the screen, then continue until the goal is complete. " +
+                    "Use screen pixels when Screen Vision is active and use read_screen for semantic Android UI. Prefer click_text over coordinates. " +
+                    "Available tools can open apps, inspect UI, tap, type, scroll, go back/home, open URLs and search the web. " +
+                    "For sending messages, deleting data, purchases/payments, security/account changes, installing software or publishing content, ask for explicit confirmation immediately before the action. " +
+                    "Never ask for passwords, OTPs, recovery codes, payment card details or secret API keys. Do not bypass protected or secure Android screens.";
+            setup.put("systemInstruction", new JSONObject().put("parts", new JSONArray().put(new JSONObject().put("text", instructions))));
             setup.put("tools", new JSONArray().put(buildFunctionTools()));
-            webSocket.send(new JSONObject().put("setup", setup).toString());
-        } catch (Exception e) {
-            updateStatus("Setup error");
-        }
+            ws.send(new JSONObject().put("setup", setup).toString());
+        } catch (Exception e) { updateStatus("Setup error"); }
     }
 
     private JSONObject buildFunctionTools() throws Exception {
         JSONArray f = new JSONArray();
-        f.put(function("open_app", "Open an installed Android app by its visible app name.", objProps("app", "string", "Visible app name"), new JSONArray().put("app")));
-        f.put(function("read_screen", "Read the current Android accessibility UI tree. Use after opening apps or when unsure what is on screen.", new JSONObject().put("type", "object").put("properties", new JSONObject()), new JSONArray()));
-        f.put(function("click_text", "Tap an on-screen element by visible text or accessibility description.", objProps("text", "string", "Visible text to tap"), new JSONArray().put("text")));
-        f.put(function("type_text", "Type text into the currently focused editable field.", objProps("text", "string", "Text to enter"), new JSONArray().put("text")));
-        f.put(function("scroll", "Scroll the current screen up or down.", objProps("direction", "string", "up or down"), new JSONArray().put("direction")));
-        f.put(function("tap", "Tap screen coordinates only when semantic clicking is impossible.", xySchema(), new JSONArray().put("x").put("y")));
+        f.put(function("open_app", "Open an installed Android app by visible name.", oneStringSchema("app", "Visible app name"), arr("app")));
+        f.put(function("read_screen", "Read the current Android UI accessibility tree. Use after actions and whenever exact UI state is uncertain.", emptySchema(), new JSONArray()));
+        f.put(function("click_text", "Tap an on-screen element by visible text or accessibility description.", oneStringSchema("text", "Visible text or description"), arr("text")));
+        f.put(function("type_text", "Type text into the focused editable field.", oneStringSchema("text", "Text to type"), arr("text")));
+        f.put(function("scroll", "Scroll current screen.", oneStringSchema("direction", "up or down"), arr("direction")));
+        JSONObject xy = new JSONObject().put("type", "object").put("properties", new JSONObject()
+                .put("x", new JSONObject().put("type", "number"))
+                .put("y", new JSONObject().put("type", "number")));
+        f.put(function("tap", "Tap raw screen coordinates as fallback.", xy, new JSONArray().put("x").put("y")));
         f.put(function("back", "Press Android Back.", emptySchema(), new JSONArray()));
         f.put(function("home", "Go to Android Home.", emptySchema(), new JSONArray()));
-        f.put(function("browser_search", "Open a Google web search for a query.", objProps("query", "string", "Search query"), new JSONArray().put("query")));
-        f.put(function("open_url", "Open an HTTPS URL in the user's browser.", objProps("url", "string", "HTTPS URL"), new JSONArray().put("url")));
+        f.put(function("browser_search", "Open Google search for a query.", oneStringSchema("query", "Search query"), arr("query")));
+        f.put(function("open_url", "Open a secure HTTPS URL.", oneStringSchema("url", "HTTPS URL"), arr("url")));
         return new JSONObject().put("functionDeclarations", f);
     }
 
-    private JSONObject function(String name, String description, JSONObject params, JSONArray required) throws Exception {
-        params.put("required", required);
-        return new JSONObject().put("name", name).put("description", description).put("parameters", params);
+    private JSONArray arr(String value) { return new JSONArray().put(value); }
+    private JSONObject emptySchema() throws Exception { return new JSONObject().put("type", "object").put("properties", new JSONObject()); }
+    private JSONObject oneStringSchema(String name, String description) throws Exception {
+        return new JSONObject().put("type", "object").put("properties", new JSONObject()
+                .put(name, new JSONObject().put("type", "string").put("description", description)));
     }
-
-    private JSONObject objProps(String name, String type, String description) throws Exception {
-        JSONObject prop = new JSONObject().put("type", type).put("description", description);
-        return new JSONObject().put("type", "object").put("properties", new JSONObject().put(name, prop));
-    }
-
-    private JSONObject xySchema() throws Exception {
-        JSONObject props = new JSONObject();
-        props.put("x", new JSONObject().put("type", "number"));
-        props.put("y", new JSONObject().put("type", "number"));
-        return new JSONObject().put("type", "object").put("properties", props);
-    }
-
-    private JSONObject emptySchema() throws Exception {
-        return new JSONObject().put("type", "object").put("properties", new JSONObject());
+    private JSONObject function(String name, String description, JSONObject parameters, JSONArray required) throws Exception {
+        parameters.put("required", required);
+        return new JSONObject().put("name", name).put("description", description).put("parameters", parameters);
     }
 
     private void handleServerMessage(JSONObject msg) throws Exception {
         if (msg.has("setupComplete")) {
             setupComplete = true;
-            updateStatus("Live • listening");
+            updateStatus(screenVisionActive ? "Live • listening • vision" : "Live • listening");
             startMicStreaming();
             return;
         }
         JSONObject server = msg.optJSONObject("serverContent");
         if (server != null) {
             if (server.optBoolean("interrupted", false)) flushAudio();
-            JSONObject inputTx = server.optJSONObject("inputTranscription");
-            if (inputTx != null) updateStatus("You: " + shorten(inputTx.optString("text", "")));
-            JSONObject outputTx = server.optJSONObject("outputTranscription");
-            if (outputTx != null) updateStatus("NexaPilot: " + shorten(outputTx.optString("text", "")));
+            JSONObject input = server.optJSONObject("inputTranscription");
+            if (input != null && !input.optString("text", "").isEmpty()) updateStatus("You: " + shorten(input.optString("text", "")));
+            JSONObject output = server.optJSONObject("outputTranscription");
+            if (output != null && !output.optString("text", "").isEmpty()) updateStatus("NexaPilot: " + shorten(output.optString("text", "")));
             JSONObject turn = server.optJSONObject("modelTurn");
             if (turn != null) {
                 JSONArray parts = turn.optJSONArray("parts");
-                if (parts != null) {
-                    for (int i = 0; i < parts.length(); i++) {
-                        JSONObject inline = parts.optJSONObject(i) == null ? null : parts.optJSONObject(i).optJSONObject("inlineData");
-                        if (inline != null && inline.optString("mimeType", "").startsWith("audio/pcm")) {
-                            playAudio(Base64.decode(inline.optString("data", ""), Base64.DEFAULT));
-                        }
+                if (parts != null) for (int i = 0; i < parts.length(); i++) {
+                    JSONObject p = parts.optJSONObject(i);
+                    JSONObject inline = p == null ? null : p.optJSONObject("inlineData");
+                    if (inline != null && inline.optString("mimeType", "").startsWith("audio/pcm")) {
+                        playAudio(Base64.decode(inline.optString("data", ""), Base64.DEFAULT));
                     }
                 }
             }
@@ -297,13 +304,11 @@ public class LiveAssistantService extends Service {
                 JSONObject args = call.optJSONObject("args");
                 if (args == null) args = new JSONObject();
                 JSONObject result = runTool(name, args);
-                try {
-                    responses.put(new JSONObject().put("id", id).put("name", name).put("response", result));
-                } catch (Exception ignored) { }
+                try { responses.put(new JSONObject().put("id", id).put("name", name).put("response", result)); }
+                catch (Exception ignored) { }
             }
-            try {
-                socket.send(new JSONObject().put("toolResponse", new JSONObject().put("functionResponses", responses)).toString());
-            } catch (Exception ignored) { }
+            try { socket.send(new JSONObject().put("toolResponse", new JSONObject().put("functionResponses", responses)).toString()); }
+            catch (Exception ignored) { }
         });
     }
 
@@ -313,11 +318,11 @@ public class LiveAssistantService extends Service {
             updateStatus("Working • " + name.replace('_', ' '));
             switch (name) {
                 case "open_app": out.put("ok", openAppByLabel(args.optString("app", ""))); break;
-                case "read_screen": return NexaAccessibilityService.readScreen();
+                case "read_screen": return NexaAccessibilityService.readScreen().put("screen_vision", screenVisionActive);
                 case "click_text": out.put("ok", NexaAccessibilityService.clickText(args.optString("text", ""))); break;
                 case "type_text": out.put("ok", NexaAccessibilityService.typeIntoFocusedField(args.optString("text", ""))); break;
                 case "scroll": out.put("ok", NexaAccessibilityService.scroll(args.optString("direction", "down"))); break;
-                case "tap": out.put("ok", NexaAccessibilityService.tap((float) args.optDouble("x", 0), (float) args.optDouble("y", 0))); break;
+                case "tap": out.put("ok", NexaAccessibilityService.tap((float)args.optDouble("x",0), (float)args.optDouble("y",0))); break;
                 case "back": out.put("ok", NexaAccessibilityService.goBack()); break;
                 case "home": out.put("ok", NexaAccessibilityService.goHome()); break;
                 case "browser_search": out.put("ok", openSearch(args.optString("query", ""))); break;
@@ -325,7 +330,7 @@ public class LiveAssistantService extends Service {
                 default: out.put("ok", false).put("error", "unsupported_tool");
             }
         } catch (Exception e) {
-            try { out.put("ok", false).put("error", e.getMessage()); } catch (Exception ignored) { }
+            try { out.put("ok", false).put("error", String.valueOf(e.getMessage())); } catch (Exception ignored) { }
         }
         return out;
     }
@@ -334,18 +339,12 @@ public class LiveAssistantService extends Service {
         if (recorder != null || !running) return;
         int min = AudioRecord.getMinBufferSize(16000, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT);
         recorder = new AudioRecord(MediaRecorder.AudioSource.VOICE_COMMUNICATION, 16000, AudioFormat.CHANNEL_IN_MONO,
-                AudioFormat.ENCODING_PCM_16BIT, Math.max(min * 2, 4096));
+                AudioFormat.ENCODING_PCM_16BIT, Math.max(4096, min * 2));
         try {
-            if (AcousticEchoCanceler.isAvailable()) {
-                aec = AcousticEchoCanceler.create(recorder.getAudioSessionId());
-                if (aec != null) aec.setEnabled(true);
-            }
-            if (NoiseSuppressor.isAvailable()) {
-                noiseSuppressor = NoiseSuppressor.create(recorder.getAudioSessionId());
-                if (noiseSuppressor != null) noiseSuppressor.setEnabled(true);
-            }
+            if (AcousticEchoCanceler.isAvailable()) { echoCanceler = AcousticEchoCanceler.create(recorder.getAudioSessionId()); if (echoCanceler != null) echoCanceler.setEnabled(true); }
+            if (NoiseSuppressor.isAvailable()) { noiseSuppressor = NoiseSuppressor.create(recorder.getAudioSessionId()); if (noiseSuppressor != null) noiseSuppressor.setEnabled(true); }
         } catch (Exception ignored) { }
-        recorder.startRecording();
+        try { recorder.startRecording(); } catch (Exception e) { updateStatus("Mic start failed"); return; }
         io.execute(() -> {
             byte[] buf = new byte[2048];
             while (running && recorder != null) {
@@ -354,8 +353,7 @@ public class LiveAssistantService extends Service {
                     byte[] chunk = new byte[n];
                     System.arraycopy(buf, 0, chunk, 0, n);
                     try {
-                        JSONObject audio = new JSONObject().put("data", Base64.encodeToString(chunk, Base64.NO_WRAP))
-                                .put("mimeType", "audio/pcm;rate=16000");
+                        JSONObject audio = new JSONObject().put("data", Base64.encodeToString(chunk, Base64.NO_WRAP)).put("mimeType", "audio/pcm;rate=16000");
                         socket.send(new JSONObject().put("realtimeInput", new JSONObject().put("audio", audio)).toString());
                     } catch (Exception ignored) { }
                 }
@@ -366,225 +364,121 @@ public class LiveAssistantService extends Service {
     private void createPlayer() {
         int min = AudioTrack.getMinBufferSize(24000, AudioFormat.CHANNEL_OUT_MONO, AudioFormat.ENCODING_PCM_16BIT);
         AudioAttributes attrs = new AudioAttributes.Builder().setUsage(AudioAttributes.USAGE_ASSISTANT).setContentType(AudioAttributes.CONTENT_TYPE_SPEECH).build();
-        AudioFormat fmt = new AudioFormat.Builder().setEncoding(AudioFormat.ENCODING_PCM_16BIT).setSampleRate(24000).setChannelMask(AudioFormat.CHANNEL_OUT_MONO).build();
-        player = new AudioTrack(attrs, fmt, Math.max(min * 4, 8192), AudioTrack.MODE_STREAM, AudioManager.AUDIO_SESSION_ID_GENERATE);
-        player.play();
+        AudioFormat fmt = new AudioFormat.Builder().setSampleRate(24000).setEncoding(AudioFormat.ENCODING_PCM_16BIT).setChannelMask(AudioFormat.CHANNEL_OUT_MONO).build();
+        player = new AudioTrack(attrs, fmt, Math.max(8192, min * 4), AudioTrack.MODE_STREAM, AudioManager.AUDIO_SESSION_ID_GENERATE);
+        try { player.play(); } catch (Exception ignored) { }
     }
 
-    private void playAudio(byte[] pcm) {
-        if (speakerEnabled && player != null && pcm != null && pcm.length > 0) player.write(pcm, 0, pcm.length);
-    }
-
-    private void flushAudio() {
-        try { if (player != null) { player.pause(); player.flush(); player.play(); } } catch (Exception ignored) { }
-    }
+    private void playAudio(byte[] pcm) { if (speakerEnabled && player != null && pcm != null && pcm.length > 0) player.write(pcm, 0, pcm.length); }
+    private void flushAudio() { try { if (player != null) { player.pause(); player.flush(); player.play(); } } catch (Exception ignored) { } }
 
     private void setMic(boolean enabled) {
         micEnabled = enabled;
         prefs.edit().putBoolean("live_mic", enabled).apply();
+        if (!enabled && socket != null && setupComplete) try { socket.send(new JSONObject().put("realtimeInput", new JSONObject().put("audioStreamEnd", true)).toString()); } catch (Exception ignored) { }
         updateOverlayButtons();
     }
-
-    private void setSpeaker(boolean enabled) {
-        speakerEnabled = enabled;
-        prefs.edit().putBoolean("live_speaker", enabled).apply();
-        if (!enabled) flushAudio();
-        updateOverlayButtons();
-    }
+    private void setSpeaker(boolean enabled) { speakerEnabled = enabled; prefs.edit().putBoolean("live_speaker", enabled).apply(); if (!enabled) flushAudio(); updateOverlayButtons(); }
 
     private boolean openAppByLabel(String requested) {
         if (requested == null || requested.trim().isEmpty()) return false;
         String want = normalize(requested);
         PackageManager pm = getPackageManager();
-        Intent query = new Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER);
-        List<ResolveInfo> apps = pm.queryIntentActivities(query, 0);
-        ResolveInfo best = null;
-        int score = -1;
+        Intent q = new Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER);
+        List<ResolveInfo> apps = pm.queryIntentActivities(q, 0);
+        ResolveInfo best = null; int bestScore = -1;
         for (ResolveInfo info : apps) {
-            String label = String.valueOf(info.loadLabel(pm));
-            int s = matchScore(want, normalize(label));
-            if (s > score) { score = s; best = info; }
+            int score = matchScore(want, normalize(String.valueOf(info.loadLabel(pm))));
+            if (score > bestScore) { bestScore = score; best = info; }
         }
-        if (best != null && score >= 60) {
+        if (best != null && bestScore >= 60) {
             Intent launch = pm.getLaunchIntentForPackage(best.activityInfo.packageName);
-            if (launch != null) {
-                launch.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
-                startActivity(launch);
-                return true;
-            }
+            if (launch != null) { launch.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK); startActivity(launch); return true; }
         }
         return false;
     }
-
     private int matchScore(String a, String b) {
-        if (a.equals(b)) return 100;
-        if (a.startsWith(b) || b.startsWith(a)) return 90;
-        if (a.contains(b) || b.contains(a)) return 80;
-        int common = 0;
-        for (String x : a.split(" ")) for (String y : b.split(" ")) if (!x.isEmpty() && x.equals(y)) common++;
+        if (a.equals(b)) return 100; if (a.startsWith(b) || b.startsWith(a)) return 90; if (a.contains(b) || b.contains(a)) return 80;
+        int common = 0; for (String x : a.split(" ")) for (String y : b.split(" ")) if (!x.isEmpty() && x.equals(y)) common++;
         return common > 0 ? 60 + Math.min(15, common * 5) : -1;
     }
-
-    private String normalize(String s) {
-        return s.toLowerCase(Locale.ROOT).replaceAll("[^a-z0-9]+", " ").replaceAll("\\s+", " ").trim();
-    }
+    private String normalize(String s) { return s == null ? "" : s.toLowerCase(Locale.ROOT).replaceAll("[^a-z0-9]+", " ").replaceAll("\\s+", " ").trim(); }
 
     private boolean openSearch(String q) {
-        try {
-            if (q == null || q.trim().isEmpty()) return false;
-            Intent i = new Intent(Intent.ACTION_VIEW, Uri.parse("https://www.google.com/search?q=" + URLEncoder.encode(q, "UTF-8")));
-            i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
-            startActivity(i);
-            return true;
-        } catch (Exception e) { return false; }
+        try { if (q == null || q.trim().isEmpty()) return false; Intent i = new Intent(Intent.ACTION_VIEW, Uri.parse("https://www.google.com/search?q=" + URLEncoder.encode(q, "UTF-8"))); i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK); startActivity(i); return true; }
+        catch (Exception e) { return false; }
     }
-
     private boolean openUrl(String url) {
-        try {
-            if (url == null || !url.startsWith("https://")) return false;
-            Intent i = new Intent(Intent.ACTION_VIEW, Uri.parse(url));
-            i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
-            startActivity(i);
-            return true;
-        } catch (Exception e) { return false; }
+        try { if (url == null || !url.startsWith("https://")) return false; Intent i = new Intent(Intent.ACTION_VIEW, Uri.parse(url)); i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK); startActivity(i); return true; }
+        catch (Exception e) { return false; }
     }
 
-    private void stopLive() {
-        running = false;
-        setupComplete = false;
-        prefs.edit().putBoolean("live_enabled", false).apply();
-        try { if (socket != null) socket.close(1000, "user stopped"); } catch (Exception ignored) { }
-        socket = null;
-        try { if (recorder != null) { recorder.stop(); recorder.release(); } } catch (Exception ignored) { }
-        recorder = null;
-        try { if (aec != null) aec.release(); } catch (Exception ignored) { }
-        try { if (noiseSuppressor != null) noiseSuppressor.release(); } catch (Exception ignored) { }
-        aec = null;
-        noiseSuppressor = null;
-        try { if (player != null) { player.stop(); player.release(); } } catch (Exception ignored) { }
-        player = null;
+    private void stopLive() { cleanup(true); }
+    private void cleanup(boolean stopSelfToo) {
+        running = false; setupComplete = false;
+        if (prefs != null) prefs.edit().putBoolean("live_enabled", false).apply();
+        try { if (socket != null) socket.close(1000, "stopped"); } catch (Exception ignored) { } socket = null;
+        try { if (recorder != null) { recorder.stop(); recorder.release(); } } catch (Exception ignored) { } recorder = null;
+        try { if (echoCanceler != null) echoCanceler.release(); } catch (Exception ignored) { } echoCanceler = null;
+        try { if (noiseSuppressor != null) noiseSuppressor.release(); } catch (Exception ignored) { } noiseSuppressor = null;
+        try { if (player != null) { player.stop(); player.release(); } } catch (Exception ignored) { } player = null;
         removeOverlay();
-        stopForeground(true);
-        stopSelf();
+        if (stopSelfToo) { stopForeground(true); stopSelf(); }
     }
 
     private void showOverlayIfAllowed() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && !Settings.canDrawOverlays(this)) return;
+        if (Build.VERSION.SDK_INT >= 23 && !Settings.canDrawOverlays(this)) return;
         if (overlay != null) return;
         runOnMain(() -> {
             try {
-                windowManager = (WindowManager) getSystemService(WINDOW_SERVICE);
-                LinearLayout box = new LinearLayout(this);
-                box.setOrientation(LinearLayout.VERTICAL);
-                box.setPadding(20, 14, 20, 14);
-                box.setBackgroundColor(Color.argb(225, 18, 24, 42));
-                overlayStatus = new TextView(this);
-                overlayStatus.setTextColor(Color.WHITE);
-                overlayStatus.setTextSize(13);
-                overlayStatus.setText("NexaPilot Live");
-                box.addView(overlayStatus);
-                LinearLayout row = new LinearLayout(this);
-                row.setOrientation(LinearLayout.HORIZONTAL);
-                overlayMic = new Button(this);
-                overlaySpeaker = new Button(this);
-                Button stop = new Button(this);
-                overlayMic.setOnClickListener(v -> setMic(!micEnabled));
-                overlaySpeaker.setOnClickListener(v -> setSpeaker(!speakerEnabled));
-                stop.setText("■");
-                stop.setOnClickListener(v -> stopLive());
-                row.addView(overlayMic);
-                row.addView(overlaySpeaker);
-                row.addView(stop);
-                box.addView(row);
+                windowManager = (WindowManager)getSystemService(WINDOW_SERVICE);
+                LinearLayout box = new LinearLayout(this); box.setOrientation(LinearLayout.VERTICAL); box.setPadding(18,12,18,12); box.setBackgroundColor(Color.argb(232,15,21,36));
+                overlayStatus = new TextView(this); overlayStatus.setTextColor(Color.WHITE); overlayStatus.setTextSize(12); overlayStatus.setText("NexaPilot Live"); box.addView(overlayStatus);
+                LinearLayout row = new LinearLayout(this); overlayMic = new Button(this); overlaySpeaker = new Button(this); Button stop = new Button(this);
+                overlayMic.setOnClickListener(v -> setMic(!micEnabled)); overlaySpeaker.setOnClickListener(v -> setSpeaker(!speakerEnabled)); stop.setText("■"); stop.setOnClickListener(v -> stopLive());
+                row.addView(overlayMic); row.addView(overlaySpeaker); row.addView(stop); box.addView(row);
                 int type = Build.VERSION.SDK_INT >= 26 ? WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY : WindowManager.LayoutParams.TYPE_PHONE;
-                WindowManager.LayoutParams lp = new WindowManager.LayoutParams(WindowManager.LayoutParams.WRAP_CONTENT, WindowManager.LayoutParams.WRAP_CONTENT,
-                        type, WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE | WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN, PixelFormat.TRANSLUCENT);
-                lp.gravity = Gravity.TOP | Gravity.END;
-                lp.x = 16;
-                lp.y = 90;
-                overlay = box;
-                windowManager.addView(overlay, lp);
-                updateOverlayButtons();
+                WindowManager.LayoutParams lp = new WindowManager.LayoutParams(WindowManager.LayoutParams.WRAP_CONTENT, WindowManager.LayoutParams.WRAP_CONTENT, type,
+                        WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE | WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN, PixelFormat.TRANSLUCENT);
+                lp.gravity = Gravity.TOP | Gravity.END; lp.x = 14; lp.y = 100;
+                overlay = box; windowManager.addView(overlay, lp); updateOverlayButtons();
             } catch (Exception ignored) { }
         });
     }
-
-    private void removeOverlay() {
-        runOnMain(() -> {
-            try { if (windowManager != null && overlay != null) windowManager.removeView(overlay); } catch (Exception ignored) { }
-            overlay = null;
-        });
-    }
-
-    private void updateOverlayButtons() {
-        runOnMain(() -> {
-            if (overlayMic != null) overlayMic.setText(micEnabled ? "🎤" : "🔇");
-            if (overlaySpeaker != null) overlaySpeaker.setText(speakerEnabled ? "🔊" : "🔈×");
-        });
-    }
-
+    private void removeOverlay() { runOnMain(() -> { try { if (windowManager != null && overlay != null) windowManager.removeView(overlay); } catch (Exception ignored) { } overlay = null; }); }
+    private void updateOverlayButtons() { runOnMain(() -> { if (overlayMic != null) overlayMic.setText(micEnabled ? "🎤" : "🔇"); if (overlaySpeaker != null) overlaySpeaker.setText(speakerEnabled ? "🔊" : "🔈×"); }); }
     private void updateStatus(String text) {
         runOnMain(() -> {
             if (overlayStatus != null) overlayStatus.setText(shorten(text));
-            NotificationManager nm = (NotificationManager) getSystemService(NOTIFICATION_SERVICE);
-            if (nm != null && running) nm.notify(NOTIFICATION_ID, buildNotificationWithText(text));
+            NotificationManager nm = (NotificationManager)getSystemService(NOTIFICATION_SERVICE);
+            if (nm != null && running) nm.notify(NOTIFICATION_ID, buildNotification(text));
         });
     }
-
-    private String shorten(String s) {
-        if (s == null) return "";
-        s = s.trim().replaceAll("\\s+", " ");
-        return s.length() > 70 ? s.substring(0, 67) + "…" : s;
-    }
-
+    private String shorten(String s) { if (s == null) return ""; s = s.trim().replaceAll("\\s+", " "); return s.length() > 72 ? s.substring(0,69) + "…" : s; }
     private void runOnMain(Runnable r) { new android.os.Handler(getMainLooper()).post(r); }
 
     private void createNotificationChannel() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+        if (Build.VERSION.SDK_INT >= 26) {
             NotificationChannel c = new NotificationChannel(CHANNEL_ID, "NexaPilot Live", NotificationManager.IMPORTANCE_LOW);
-            c.setDescription("Live voice assistant session");
-            NotificationManager nm = getSystemService(NotificationManager.class);
-            if (nm != null) nm.createNotificationChannel(c);
+            c.setDescription("Live AI conversation and phone control");
+            NotificationManager nm = getSystemService(NotificationManager.class); if (nm != null) nm.createNotificationChannel(c);
         }
     }
-
-    private Notification buildNotification() { return buildNotificationWithText("Live voice session active"); }
-
-    private Notification buildNotificationWithText(String text) {
-        Intent open = new Intent(this, MainActivity.class);
-        PendingIntent pi = PendingIntent.getActivity(this, 0, open,
-                Build.VERSION.SDK_INT >= Build.VERSION_CODES.M ? PendingIntent.FLAG_IMMUTABLE | PendingIntent.FLAG_UPDATE_CURRENT : PendingIntent.FLAG_UPDATE_CURRENT);
-        Notification.Builder b = Build.VERSION.SDK_INT >= Build.VERSION_CODES.O ? new Notification.Builder(this, CHANNEL_ID) : new Notification.Builder(this);
-        return b.setContentTitle("NexaPilot Live").setContentText(shorten(text)).setSmallIcon(android.R.drawable.ic_btn_speak_now)
-                .setOngoing(true).setContentIntent(pi).build();
+    private Notification buildNotification(String text) {
+        Intent open = new Intent(this, NexaPilotActivity.class);
+        PendingIntent pi = PendingIntent.getActivity(this, 0, open, Build.VERSION.SDK_INT >= 23 ? PendingIntent.FLAG_IMMUTABLE | PendingIntent.FLAG_UPDATE_CURRENT : PendingIntent.FLAG_UPDATE_CURRENT);
+        Notification.Builder b = Build.VERSION.SDK_INT >= 26 ? new Notification.Builder(this, CHANNEL_ID) : new Notification.Builder(this);
+        return b.setContentTitle("NexaPilot Live").setContentText(shorten(text)).setSmallIcon(android.R.drawable.ic_btn_speak_now).setOngoing(true).setContentIntent(pi).build();
     }
 
     private HttpResult request(String method, String urlValue, String body, String bearer) throws Exception {
-        HttpURLConnection conn = (HttpURLConnection) new URL(urlValue).openConnection();
-        conn.setRequestMethod(method);
-        conn.setConnectTimeout(15000);
-        conn.setReadTimeout(30000);
-        conn.setRequestProperty("apikey", SUPABASE_KEY);
-        conn.setRequestProperty("Content-Type", "application/json");
+        HttpURLConnection conn = (HttpURLConnection)new URL(urlValue).openConnection();
+        conn.setRequestMethod(method); conn.setConnectTimeout(15000); conn.setReadTimeout(30000); conn.setRequestProperty("apikey", SUPABASE_KEY); conn.setRequestProperty("Content-Type", "application/json");
         if (bearer != null) conn.setRequestProperty("Authorization", "Bearer " + bearer);
-        if (body != null) {
-            conn.setDoOutput(true);
-            try (OutputStream out = conn.getOutputStream()) { out.write(body.getBytes(StandardCharsets.UTF_8)); }
-        }
-        int code = conn.getResponseCode();
-        InputStream stream = code >= 200 && code < 400 ? conn.getInputStream() : conn.getErrorStream();
-        StringBuilder text = new StringBuilder();
-        if (stream != null) {
-            try (BufferedReader reader = new BufferedReader(new InputStreamReader(stream, StandardCharsets.UTF_8))) {
-                String line; while ((line = reader.readLine()) != null) text.append(line);
-            }
-        }
-        conn.disconnect();
-        return new HttpResult(code, text.toString());
+        if (body != null) { conn.setDoOutput(true); try (OutputStream out = conn.getOutputStream()) { out.write(body.getBytes(StandardCharsets.UTF_8)); } }
+        int code = conn.getResponseCode(); InputStream stream = code >= 200 && code < 400 ? conn.getInputStream() : conn.getErrorStream(); StringBuilder s = new StringBuilder();
+        if (stream != null) try (BufferedReader br = new BufferedReader(new InputStreamReader(stream, StandardCharsets.UTF_8))) { String line; while ((line = br.readLine()) != null) s.append(line); }
+        conn.disconnect(); return new HttpResult(code, s.toString());
     }
-
-    private static class HttpResult {
-        final int code; final String body;
-        HttpResult(int code, String body) { this.code = code; this.body = body; }
-    }
+    private static class HttpResult { final int code; final String body; HttpResult(int code, String body) { this.code = code; this.body = body; } }
 }
