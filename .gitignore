@@ -1,0 +1,28 @@
+# Secrets
+.env
+.env.*
+!.env.example
+
+# Node
+node_modules/
+dist/
+.next/
+
+# Android
+.gradle/
+local.properties
+*.apk
+*.aab
+
+# Windows/.NET
+bin/
+obj/
+.vs/
+*.user
+*.suo
+
+# OS/editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
