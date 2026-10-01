@@ -1,9 +1,12 @@
 package com.nexapilot.mobile;
 
+import android.Manifest;
 import android.app.Activity;
 import android.content.ActivityNotFoundException;
 import android.content.Intent;
 import android.content.SharedPreferences;
+import android.content.pm.PackageManager;
+import android.content.pm.ResolveInfo;
 import android.graphics.Color;
 import android.net.Uri;
 import android.os.Build;
@@ -30,6 +33,7 @@ import java.net.HttpURLConnection;
 import java.net.URL;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.List;
 import java.util.Locale;
 import java.util.UUID;
 
@@ -37,6 +41,7 @@ public class MainActivity extends Activity {
     private static final String SUPABASE_URL = "https://cdwcvmeruzjhjcahehqg.supabase.co";
     private static final String SUPABASE_KEY = "sb_publishable_EPJE4UJ1EcsGuf2uZxvmyg_fc3QJU2F";
     private static final int VOICE_REQUEST = 2001;
+    private static final int AUDIO_PERMISSION_REQUEST = 2002;
 
     private SharedPreferences prefs;
     private String accessToken;
@@ -50,6 +55,9 @@ public class MainActivity extends Activity {
     private TextView statusText;
     private TextView planText;
     private TextView deviceText;
+    private TextView liveStatusText;
+    private Button micButton;
+    private Button speakerButton;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -101,7 +109,7 @@ public class MainActivity extends Activity {
         TextView title = text("NexaPilot Mobile", 28);
         title.setTextColor(Color.WHITE);
         root.addView(title);
-        root.addView(text("AI command center for this phone and your connected devices. v0.2.0", 14));
+        root.addView(text("Live AI device assistant • v0.3.0", 14));
 
         statusText = text("Ready", 14);
         root.addView(statusText);
@@ -133,6 +141,28 @@ public class MainActivity extends Activity {
         deviceText = text("Device: not registered", 14);
         commandPanel.addView(deviceText);
 
+        commandPanel.addView(text("LIVE MODE", 20));
+        liveStatusText = text("Live Mode OFF", 15);
+        commandPanel.addView(liveStatusText);
+
+        Button liveOn = button("▶ START LIVE MODE");
+        liveOn.setOnClickListener(v -> startLiveMode());
+        commandPanel.addView(liveOn);
+
+        Button liveOff = button("■ STOP LIVE MODE");
+        liveOff.setOnClickListener(v -> sendLiveAction(LiveAssistantService.ACTION_STOP));
+        commandPanel.addView(liveOff);
+
+        micButton = button("");
+        micButton.setOnClickListener(v -> toggleMic());
+        commandPanel.addView(micButton);
+
+        speakerButton = button("");
+        speakerButton.setOnClickListener(v -> toggleSpeaker());
+        commandPanel.addView(speakerButton);
+
+        commandPanel.addView(text("Live example: 'NexaPilot, YouTube kholo' ya 'NexaPilot, Google pe AI agents search karo'.", 13));
+
         Button accessibility = button("Enable phone control (Accessibility)");
         accessibility.setOnClickListener(v -> startActivity(new Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)));
         commandPanel.addView(accessibility);
@@ -144,17 +174,17 @@ public class MainActivity extends Activity {
         });
         commandPanel.addView(testHome);
 
-        commandPanel.addView(text("AI Command", 18));
+        commandPanel.addView(text("Manual Command", 18));
         commandInput = input("Example: Open ChatGPT");
         commandInput.setMinLines(3);
         commandInput.setGravity(android.view.Gravity.TOP);
         commandPanel.addView(commandInput);
 
-        Button voice = button("🎤 Voice command");
+        Button voice = button("🎤 ONE-TIME VOICE COMMAND");
         voice.setOnClickListener(v -> startVoiceInput());
         commandPanel.addView(voice);
 
-        Button run = button("Run command with NexaPilot AI");
+        Button run = button("RUN COMMAND WITH NEXAPILOT AI");
         run.setOnClickListener(v -> planCommand(true));
         commandPanel.addView(run);
 
@@ -172,6 +202,66 @@ public class MainActivity extends Activity {
         commandPanel.addView(signOut);
 
         setContentView(scroll);
+        refreshLiveControls();
+    }
+
+    private void startLiveMode() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+            requestPermissions(new String[]{Manifest.permission.RECORD_AUDIO}, AUDIO_PERMISSION_REQUEST);
+            return;
+        }
+        sendLiveAction(LiveAssistantService.ACTION_START);
+        prefs.edit().putBoolean("live_enabled", true).apply();
+        refreshLiveControls();
+        Toast.makeText(this, "NexaPilot Live started", Toast.LENGTH_SHORT).show();
+    }
+
+    private void sendLiveAction(String action) {
+        Intent intent = new Intent(this, LiveAssistantService.class);
+        intent.setAction(action);
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && !LiveAssistantService.ACTION_STOP.equals(action)) {
+            startForegroundService(intent);
+        } else {
+            startService(intent);
+        }
+        if (LiveAssistantService.ACTION_STOP.equals(action)) {
+            prefs.edit().putBoolean("live_enabled", false).apply();
+        }
+        refreshLiveControls();
+    }
+
+    private void toggleMic() {
+        boolean enabled = prefs.getBoolean("live_mic", true);
+        prefs.edit().putBoolean("live_mic", !enabled).apply();
+        sendLiveAction(!enabled ? LiveAssistantService.ACTION_MIC_ON : LiveAssistantService.ACTION_MIC_OFF);
+        refreshLiveControls();
+    }
+
+    private void toggleSpeaker() {
+        boolean enabled = prefs.getBoolean("live_speaker", true);
+        prefs.edit().putBoolean("live_speaker", !enabled).apply();
+        sendLiveAction(!enabled ? LiveAssistantService.ACTION_SPEAKER_ON : LiveAssistantService.ACTION_SPEAKER_OFF);
+        refreshLiveControls();
+    }
+
+    private void refreshLiveControls() {
+        if (micButton == null || speakerButton == null || liveStatusText == null) return;
+        boolean live = prefs.getBoolean("live_enabled", false);
+        boolean mic = prefs.getBoolean("live_mic", true);
+        boolean speaker = prefs.getBoolean("live_speaker", true);
+        liveStatusText.setText("Live Mode " + (live ? "ON" : "OFF") + " • Mic " + (mic ? "ON" : "OFF") + " • Speaker " + (speaker ? "ON" : "OFF"));
+        micButton.setText(mic ? "🎤 MIC ON — tap to mute" : "🎤 MIC OFF — tap to enable");
+        speakerButton.setText(speaker ? "🔊 SPEAKER ON — tap to mute" : "🔇 SPEAKER OFF — tap to enable");
+    }
+
+    @Override
+    public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] grantResults) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults);
+        if (requestCode == AUDIO_PERMISSION_REQUEST && grantResults.length > 0 && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
+            startLiveMode();
+        } else if (requestCode == AUDIO_PERMISSION_REQUEST) {
+            Toast.makeText(this, "Mic permission ke baghair Live Mode sun nahi sakta.", Toast.LENGTH_LONG).show();
+        }
     }
 
     private void startVoiceInput() {
@@ -203,6 +293,7 @@ public class MainActivity extends Activity {
         authPanel.setVisibility(signedIn ? View.GONE : View.VISIBLE);
         commandPanel.setVisibility(signedIn ? View.VISIBLE : View.GONE);
         statusText.setText(signedIn ? "Signed in • " + (NexaAccessibilityService.isRunning() ? "Phone control ON" : "Phone control OFF") : "Sign in to connect this phone.");
+        refreshLiveControls();
     }
 
     @Override
@@ -269,14 +360,16 @@ public class MainActivity extends Activity {
                         .put("name", label)
                         .put("platform", "android")
                         .put("os_version", "Android " + Build.VERSION.RELEASE)
-                        .put("agent_version", "0.2.0")
+                        .put("agent_version", "0.3.0")
                         .put("status", "online")
                         .put("last_seen_at", java.time.Instant.now().toString())
                         .put("capabilities", new JSONObject()
                                 .put("accessibility", true)
                                 .put("gestures", Build.VERSION.SDK_INT >= 24)
                                 .put("voice", true)
-                                .put("open_app", true)
+                                .put("live_mode", true)
+                                .put("tts", true)
+                                .put("dynamic_app_launch", true)
                                 .put("open_url", true)
                                 .put("type_text", true));
 
@@ -313,7 +406,7 @@ public class MainActivity extends Activity {
                     return;
                 }
                 if (result.code < 200 || result.code >= 300) {
-                    ui(() -> planText.setText("AI temporarily unavailable (HTTP " + result.code + "). Try again in a moment.\n" + result.body));
+                    ui(() -> planText.setText("AI temporarily unavailable (HTTP " + result.code + "). Try again.\n" + result.body));
                     return;
                 }
                 JSONObject json = new JSONObject(result.body);
@@ -354,11 +447,17 @@ public class MainActivity extends Activity {
         try {
             switch (tool) {
                 case "open_app":
-                    openApp(args.optString("app", args.optString("package", "")));
+                    if (!openAppByLabel(args.optString("app", args.optString("package", "")))) {
+                        Toast.makeText(this, "App not found", Toast.LENGTH_LONG).show();
+                    }
                     break;
                 case "open_url":
                     String url = args.optString("url", "");
                     if (!url.isEmpty()) startActivity(new Intent(Intent.ACTION_VIEW, Uri.parse(url)));
+                    break;
+                case "browser_search":
+                    String query = args.optString("query", args.optString("text", ""));
+                    if (!query.isEmpty()) startActivity(new Intent(Intent.ACTION_VIEW, Uri.parse("https://www.google.com/search?q=" + Uri.encode(query))));
                     break;
                 case "press_key":
                     String key = args.optString("key", "").toLowerCase(Locale.ROOT);
@@ -376,41 +475,62 @@ public class MainActivity extends Activity {
         }
     }
 
-    private void openApp(String appName) {
-        String value = appName == null ? "" : appName.trim();
-        if (value.isEmpty()) return;
-        String lower = value.toLowerCase(Locale.ROOT);
-        String[] candidates;
-        if (lower.contains("chatgpt")) {
-            candidates = new String[]{"com.openai.chatgpt"};
-        } else if (lower.contains("chrome")) {
-            candidates = new String[]{"com.android.chrome"};
-        } else if (lower.contains("youtube")) {
-            candidates = new String[]{"com.google.android.youtube"};
-        } else if (lower.contains("whatsapp")) {
-            candidates = new String[]{"com.whatsapp"};
-        } else if (lower.contains("facebook")) {
-            candidates = new String[]{"com.facebook.katana"};
-        } else if (lower.contains("instagram")) {
-            candidates = new String[]{"com.instagram.android"};
-        } else {
-            candidates = new String[]{value};
-        }
+    private boolean openAppByLabel(String requested) {
+        String want = normalizeName(requested);
+        if (want.isEmpty()) return false;
+        PackageManager pm = getPackageManager();
+        Intent launcher = new Intent(Intent.ACTION_MAIN, null);
+        launcher.addCategory(Intent.CATEGORY_LAUNCHER);
+        List<ResolveInfo> apps = pm.queryIntentActivities(launcher, 0);
 
-        for (String pkg : candidates) {
-            Intent launch = getPackageManager().getLaunchIntentForPackage(pkg);
-            if (launch != null) {
-                startActivity(launch);
-                return;
+        ResolveInfo best = null;
+        int bestScore = -1;
+        for (ResolveInfo info : apps) {
+            CharSequence labelCs = info.loadLabel(pm);
+            String label = labelCs == null ? "" : labelCs.toString();
+            int score = matchScore(want, normalizeName(label));
+            if (score > bestScore) {
+                bestScore = score;
+                best = info;
             }
         }
-        Toast.makeText(this, "App not found: " + value, Toast.LENGTH_LONG).show();
+
+        if (best != null && bestScore >= 60) {
+            Intent launch = pm.getLaunchIntentForPackage(best.activityInfo.packageName);
+            if (launch != null) {
+                startActivity(launch);
+                return true;
+            }
+        }
+
+        Intent pkg = pm.getLaunchIntentForPackage(requested.trim());
+        if (pkg != null) {
+            startActivity(pkg);
+            return true;
+        }
+        return false;
+    }
+
+    private String normalizeName(String value) {
+        return value == null ? "" : value.toLowerCase(Locale.ROOT).replaceAll("[^a-z0-9]+", " ").replaceAll("\\s+", " ").trim();
+    }
+
+    private int matchScore(String want, String label) {
+        if (want.equals(label)) return 100;
+        if (label.startsWith(want) || want.startsWith(label)) return 90;
+        if (label.contains(want) || want.contains(label)) return 80;
+        String[] a = want.split(" ");
+        String[] b = label.split(" ");
+        int common = 0;
+        for (String x : a) for (String y : b) if (!x.isEmpty() && x.equals(y)) common++;
+        return common > 0 ? 60 + Math.min(15, common * 5) : -1;
     }
 
     private void signOut() {
+        sendLiveAction(LiveAssistantService.ACTION_STOP);
         accessToken = null;
         userId = null;
-        prefs.edit().remove("access_token").remove("user_id").apply();
+        prefs.edit().remove("access_token").remove("user_id").putBoolean("live_enabled", false).apply();
         refreshPanels();
     }
 
